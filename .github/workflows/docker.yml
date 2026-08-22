@@ -28,14 +28,18 @@ jobs:
   build:
     name: Build ${{ matrix.arch }} binaries
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/rust-cross/rust-musl-cross:${{ matrix.builder }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             target: x86_64-unknown-linux-musl
+            builder: x86_64-musl
           - arch: arm64
             target: aarch64-unknown-linux-musl
+            builder: aarch64-musl
 
     steps:
       - name: Check out source
@@ -44,11 +48,15 @@ jobs:
           submodules: recursive
 
       - name: Build static binaries
-        uses: houseabsolute/actions-rust-cross@v1
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          args: "--locked --release --all-features"
+        shell: bash
+        run: |
+          set -o pipefail
+          if cargo build --locked --release --all-features --target "${{ matrix.target }}" 2>&1 | tee build.log; then
+            exit 0
+          fi
+          message=$(tail -n 30 build.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+          echo "::error title=Rust build failed::$message"
+          exit 1
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
