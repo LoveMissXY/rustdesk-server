@@ -1,0 +1,183 @@
+name: Docker image
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to publish
+        required: false
+        default: latest
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} binaries
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build static binaries
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--locked --release --all-features"
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-server-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            target/${{ matrix.target }}/release/hbbs
+            target/${{ matrix.target }}/release/hbbr
+            target/${{ matrix.target }}/release/rustdesk-utils
+
+  package:
+    name: Publish ${{ matrix.arch }} image
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            s6_arch: x86_64
+          - arch: arm64
+            platform: linux/arm64
+            s6_arch: aarch64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: rustdesk-server-${{ matrix.arch }}
+          path: docker/rootfs/usr/bin
+
+      - name: Make binaries executable
+        run: chmod a+x docker/rootfs/usr/bin/hbbs docker/rootfs/usr/bin/hbbr docker/rootfs/usr/bin/rustdesk-utils
+
+      - name: Prepare image names
+        id: meta
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="latest"
+          fi
+          version="${version:-latest}"
+          version=$(printf '%s' "$version" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g')
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          build-args: S6_ARCH=${{ matrix.s6_arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}-${{ matrix.arch }}
+
+  manifest:
+    name: Publish multi-architecture manifest
+    needs: package
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Prepare image names
+        id: meta
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="latest"
+          fi
+          version="${version:-latest}"
+          version=$(printf '%s' "$version" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g')
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create version manifest
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-amd64" \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-arm64"
+
+      - name: Create commit manifest
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}" \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}-amd64" \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}-arm64"
